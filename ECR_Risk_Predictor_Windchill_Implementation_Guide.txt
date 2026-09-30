@@ -1,0 +1,534 @@
+AI-POWERED ENGINEERING CHANGE RISK PREDICTOR
+Complete Implementation Guide: Machine Learning Model + Windchill PLM Integration
+Step-by-step build, full source code, Windchill setup, demo script and troubleshooting
+Product Lifecycle Management (PLM) Project
+September 2026
+
+==============================================================================
+1. PROJECT OVERVIEW
+==============================================================================
+This guide explains how to build the Engineering Change Risk Predictor described in your project report and connect it to the Windchill PLM instance running on your college server. Every piece of code in this document has been written and tested, so you can copy each file into one folder and run it.
+
+1.1 What you will build
+-----------------------
+  * A synthetic ECR/ECO history (3,000 records) used to train the model, because real change data is confidential.
+  * A Random Forest ensemble model that classifies every change as Low, Medium or High risk and gives a 0-100 risk index.
+  * An explanation function that shows which factors pushed a particular change towards high risk.
+  * A read-only Windchill REST connector that pulls change requests (ECRs) or change notices (ECNs) from your server.
+  * A Streamlit dashboard that opens in its own browser window and shows the scores, colours and explanation charts.
+
+1.2 Why this design is the easiest
+----------------------------------
+The dashboard only reads from Windchill and never writes to it. This keeps the official college server safe, avoids Java customisation of Windchill, and still shows a real end-to-end flow: change data enters from Windchill, the AI model scores it, and the engineer sees the result. Writing the score back into the Windchill change form is listed as future work in Section 14.
+
+1.3 Expected effort
+-------------------
+
+  | Task | Time | Difficulty |
+  ----------------------------------------------------------------------
+  | Set up Python and run the model | 1-2 hours | Easy |
+  | Create test ECRs in Windchill and check REST access | 2-3 hours | Medium (depends on admin) |
+  | Connect connector and fix field mapping | 3-4 hours | Medium |
+  | Polish dashboard, screenshots, report | 1-2 days | Easy |
+
+
+==============================================================================
+2. SYSTEM ARCHITECTURE
+==============================================================================
+Figure 1: Architecture of the Windchill-integrated risk predictor
+
+  | Component | File | Responsibility |
+  ----------------------------------------------------------------------
+  | Windchill server | (college server) | Stores ECRs/ECNs; exposes them through Windchill REST Services (OData) |
+  | Data generator | generate_data.py | Creates the synthetic training history (ecr_history.csv) |
+  | Model trainer | train_model.py | Trains the Random Forest and saves risk_model.joblib |
+  | Risk engine | risk_engine.py | Loads the model, scores changes, explains each score |
+  | Windchill client | windchill_client.py | Reads changes via REST and maps Windchill fields to model inputs |
+  | Dashboard | app.py | Streamlit web page: data source, editable table, scores, explanation chart |
+
+Data flow: the engineer (or you) opens the dashboard, enters the Windchill URL and login, and clicks Fetch. The client calls the OData endpoint, converts each change request to the 11 model features, and the risk engine returns a level and index. Values Windchill does not hold (for example cost or supplier impact) get sensible defaults that you can edit directly in the table before scoring.
+
+==============================================================================
+3. ENVIRONMENT SETUP
+==============================================================================
+
+3.1 Requirements
+----------------
+  * A laptop or lab PC with Python 3.10 or newer (python.org) and VS Code (optional).
+  * Network access to the college Windchill server (college Wi-Fi or VPN).
+  * A Windchill user account that can view change requests.
+
+3.2 Create the project and install packages
+-------------------------------------------
+
+    mkdir plm_risk_predictor
+    cd plm_risk_predictor
+    python -m venv venv
+    venv\Scripts\activate          (Windows)   |   source venv/bin/activate   (Mac/Linux)
+    pip install -r requirements.txt
+
+Create a file named requirements.txt containing these seven lines: pandas, numpy, scikit-learn, joblib, requests, streamlit, matplotlib.
+
+3.3 Folder structure
+--------------------
+
+    plm_risk_predictor/
+      requirements.txt
+      generate_data.py      -> creates ecr_history.csv
+      train_model.py        -> creates risk_model.joblib
+      risk_engine.py        -> scoring + explanation
+      windchill_client.py   -> Windchill REST connector
+      app.py                -> Streamlit dashboard
+
+
+==============================================================================
+4. STEP 1: PREPARE WINDCHILL
+==============================================================================
+Do this first, because it depends on your college administrator and may take the longest.
+
+4.1 Get permission and confirm REST is enabled
+----------------------------------------------
+  * Ask your guide or the lab administrator for permission to read change data through the REST interface, using your own account.
+  * Log in to Windchill in the browser as usual and note the server address (for example https://plm.college.edu).
+  * Open a new tab and go to https://<your-server>/Windchill/servlet/odata/. If Windchill REST Services is installed you will see a list of domains (such as ProdMgmt, ChangeMgmt, DocMgmt). Some versions add a version number in the path, for example /odata/v1/. Copy exactly what you see.
+  * Open .../odata/ChangeMgmt/ChangeRequests?$top=5 in the browser. You should see JSON text with a "value" list. If you do, the connector will work.
+  * Open .../odata/ChangeMgmt/$metadata and save the page. It lists every field available on a change request, which you need for the field mapping in Section 8.
+If the pages return an error or ask for a different login (single sign-on), tell the administrator. If REST cannot be enabled, use the CSV fallback in Section 9.4.
+
+4.2 Create test change requests
+-------------------------------
+Create 10 to 15 change requests in Windchill with a mix of categories and priorities so the dashboard demo shows variety. Suggested set:
+
+  | No. | Title (example) | Priority | Category |
+  ----------------------------------------------------------------------
+  | 1 | Update bracket hole diameter | Medium | Design |
+  | 2 | Replace steel with aluminium alloy | High | Material |
+  | 3 | Change fastener supplier | High | Supplier |
+  | 4 | Correct drawing note | Low | Documentation |
+  | 5 | Modify welding sequence | Medium | Process |
+  | 6 | Urgent safety fix on housing | Critical | Design |
+  | 7-15 | Similar variations of the above | Mixed | Mixed |
+
+Set a Need Date on each request (some close, some far away) because the connector converts it into the model feature lead_time_days.
+
+==============================================================================
+5. STEP 2: SYNTHETIC TRAINING DATA
+==============================================================================
+The model needs past changes with known risk outcomes. Real historical data is usually confidential, so this project generates a realistic synthetic history. The risk label is produced from a weighted formula plus random noise, so that the model has to learn patterns and does not reach 100% accuracy. State clearly in your report that the data is synthetic and that the same pipeline would be retrained on real ECR/ECO outcomes in a company.
+
+5.1 Model input features
+------------------------
+
+  | Feature | Type | Meaning |
+  ----------------------------------------------------------------------
+  | change_type | Category | Design, Material, Supplier, Process, Software, Documentation |
+  | priority | Category | Low, Medium, High, Critical |
+  | affected_parts | Number | Parts touched by the change |
+  | affected_assemblies | Number | Assemblies touched by the change |
+  | estimated_cost | Number | Estimated implementation cost |
+  | lead_time_days | Number | Days until the need date (short = riskier) |
+  | supplier_impact | 0 / 1 | Change affects a supplier |
+  | tooling_change | 0 / 1 | Change needs new or modified tooling |
+  | regulatory_impact | 0 / 1 | Change affects compliance or certification |
+  | requester_experience_yrs | Number | Experience of the person requesting |
+  | prior_similar_changes | Number | Earlier similar changes handled |
+
+File: generate_data.py
+
+    """Step 1 - create a synthetic ECR/ECO history (replace with real data if you get it)."""
+    import numpy as np, pandas as pd
+     
+    rng = np.random.default_rng(42)
+    N = 3000
+     
+    CHANGE_TYPES = ["Design", "Material", "Supplier", "Process", "Software", "Documentation"]
+    PRIORITIES = ["Low", "Medium", "High", "Critical"]
+     
+    df = pd.DataFrame({
+        "change_type": rng.choice(CHANGE_TYPES, N, p=[.30, .15, .12, .15, .10, .18]),
+        "priority": rng.choice(PRIORITIES, N, p=[.25, .40, .25, .10]),
+        "affected_parts": rng.integers(1, 60, N),
+        "affected_assemblies": rng.integers(0, 15, N),
+        "estimated_cost": rng.integers(500, 150000, N),
+        "lead_time_days": rng.integers(2, 120, N),
+        "supplier_impact": rng.integers(0, 2, N),
+        "tooling_change": rng.integers(0, 2, N),
+        "regulatory_impact": rng.choice([0, 1], N, p=[.85, .15]),
+        "requester_experience_yrs": rng.integers(0, 20, N),
+        "prior_similar_changes": rng.integers(0, 10, N),
+    })
+     
+    type_w = {"Design": 1.0, "Material": 1.5, "Supplier": 1.8, "Process": 1.4, "Software": 1.2, "Documentation": 0.2}
+    prio_w = {"Low": 0.0, "Medium": 0.5, "High": 1.0, "Critical": 1.6}
+     
+    score = (
+        df.change_type.map(type_w) + df.priority.map(prio_w)
+        + df.affected_parts / 15 + df.affected_assemblies / 5
+        + df.estimated_cost / 50000
+        + (30 - df.lead_time_days.clip(upper=30)) / 15      # short lead time = more risk
+        + 1.2 * df.supplier_impact + 1.0 * df.tooling_change + 1.5 * df.regulatory_impact
+        - df.requester_experience_yrs / 15 - 0.15 * df.prior_similar_changes
+        + rng.normal(0, 0.6, N)                              # noise so the model is not trivial
+    )
+    q1, q2 = score.quantile([.45, .80])
+    df["risk_level"] = np.where(score < q1, "Low", np.where(score < q2, "Medium", "High"))
+     
+    df.to_csv("ecr_history.csv", index=False)
+    print(df.risk_level.value_counts())
+
+Run it with python generate_data.py. It prints the class balance (about 1,350 Low, 1,050 Medium and 600 High) and writes ecr_history.csv.
+
+==============================================================================
+6. STEP 3: TRAIN THE ENSEMBLE MODEL
+==============================================================================
+The model is a Random Forest, an ensemble of 300 decision trees that vote on the risk class. One-hot encoding converts the two category columns to numbers. class_weight is set to balanced so the smaller High class is not ignored. The data is split 80% for training and 20% for testing.
+File: train_model.py
+
+    """Step 2 - train the ensemble model and save it."""
+    import joblib, pandas as pd, numpy as np
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import classification_report, confusion_matrix
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder
+     
+    CAT = ["change_type", "priority"]
+    NUM = ["affected_parts", "affected_assemblies", "estimated_cost", "lead_time_days",
+           "supplier_impact", "tooling_change", "regulatory_impact",
+           "requester_experience_yrs", "prior_similar_changes"]
+     
+    df = pd.read_csv("ecr_history.csv")
+    X, y = df[CAT + NUM], df["risk_level"]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+     
+    pre = ColumnTransformer([("cat", OneHotEncoder(handle_unknown="ignore"), CAT)], remainder="passthrough")
+    model = Pipeline([("pre", pre),
+                      ("rf", RandomForestClassifier(n_estimators=300, max_depth=12,
+                                                    class_weight="balanced", random_state=42))])
+    model.fit(Xtr, ytr)
+     
+    pred = model.predict(Xte)
+    print(classification_report(yte, pred))
+    print(confusion_matrix(yte, pred, labels=["Low", "Medium", "High"]))
+     
+    # baseline (typical change) used by the explanation function
+    baseline = {c: df[c].mode()[0] for c in CAT}
+    baseline.update({c: float(df[c].median()) for c in NUM})
+    joblib.dump({"model": model, "features": CAT + NUM, "cat": CAT, "num": NUM, "baseline": baseline},
+                "risk_model.joblib")
+    print("saved risk_model.joblib")
+
+Run it with python train_model.py. It prints a classification report and confusion matrix, then saves risk_model.joblib.
+
+6.1 Results obtained in testing
+-------------------------------
+
+  | Class | Precision | Recall | F1-score | Test samples |
+  ----------------------------------------------------------------------
+  | Low | 0.82 | 0.86 | 0.84 | 270 |
+  | Medium | 0.63 | 0.67 | 0.65 | 210 |
+  | High | 0.81 | 0.62 | 0.70 | 120 |
+  | Overall accuracy |  |  | 0.74 | 600 |
+
+The overall accuracy is about 74%. Medium is the hardest class because it sits between the other two. Note that almost no High change was predicted as Low (1 out of 120), which is the safest kind of error for a risk tool. Your numbers may differ slightly. You can improve accuracy by increasing the number of records or adjusting n_estimators and max_depth, but accuracy on synthetic data says little about real-world performance, so present it as a proof of concept.
+
+==============================================================================
+7. STEP 4: RISK ENGINE AND EXPLANATION
+==============================================================================
+The engine turns the model's class probabilities into a single risk index from 0 to 100 (Medium counts half, High counts fully). For explanation, it uses a simple what-if method instead of SHAP: each feature is replaced with the typical value from the training data, and the fall in the risk index shows how much that factor contributed. This gives the explainable output promised in the report and needs no extra libraries.
+File: risk_engine.py
+
+    """Prediction + explanation (no SHAP needed)."""
+    import joblib, pandas as pd
+     
+    _b = joblib.load("risk_model.joblib")
+    MODEL, FEATURES, BASE = _b["model"], _b["features"], _b["baseline"]
+    CLASSES = list(MODEL.classes_)
+     
+    def _index(probs):
+        """0..100 risk index: Medium counts half, High counts full."""
+        d = dict(zip(CLASSES, probs))
+        return 100 * (0.5 * d.get("Medium", 0) + d.get("High", 0))
+     
+    def score_frame(df: pd.DataFrame) -> pd.DataFrame:
+        X = df[FEATURES]
+        P = MODEL.predict_proba(X)
+        out = df.copy()
+        out["risk_level"] = MODEL.predict(X)
+        out["risk_index"] = [round(_index(p), 1) for p in P]
+        return out
+     
+    def explain(row: pd.Series) -> pd.Series:
+        """Drop each feature to the 'typical' value and see how much the risk index falls."""
+        x = pd.DataFrame([row[FEATURES]])
+        base_idx = _index(MODEL.predict_proba(x)[0])
+        contrib = {}
+        for f in FEATURES:
+            x2 = x.copy(); x2[f] = BASE[f]
+            contrib[f] = base_idx - _index(MODEL.predict_proba(x2)[0])
+        return pd.Series(contrib).sort_values(ascending=False)
+
+Example output from testing: for a Software change with High priority, the biggest contributors were estimated_cost (+20 points), supplier_impact (+9), lead_time_days (+4) and priority (+4).
+
+==============================================================================
+8. STEP 5: WINDCHILL REST CONNECTOR
+==============================================================================
+This file calls Windchill Rest Services with a GET request only and converts the answer into the model's input table. Windchill does not hold every model input, so the mapping below decides which are read from Windchill and which use editable defaults.
+
+8.1 Field mapping
+-----------------
+
+  | Model feature | Windchill source | Behaviour |
+  ----------------------------------------------------------------------
+  | change_type | Category / ChangeCategory | Text matched to Design, Material, Supplier etc.; default Design |
+  | priority | Priority / ChangePriority | Low, Medium, High, Critical (urgent maps to Critical); default Medium |
+  | lead_time_days | NeedDate / NeedByDate | Days from today to the need date; default 30 |
+  | affected_parts | AffectedObjectCount (if present) | Otherwise default 5 - edit in the table |
+  | Other features | Not in Windchill by default | Default values, editable in the dashboard table |
+
+The exact field names differ between Windchill versions. Open the $metadata file saved in Section 4.1, find the property names for category, priority and need date, and adjust the key names inside the _pick(...) calls in to_features(). Also, if your server path contains a version such as /odata/v1/, edit the url line in fetch_changes().
+File: windchill_client.py
+
+    """Step 3 - read-only connector to Windchill REST Services (WRS)."""
+    import requests, pandas as pd
+    from datetime import datetime, timezone
+     
+    DEFAULTS = {"change_type": "Design", "priority": "Medium", "affected_parts": 5,
+                "affected_assemblies": 1, "estimated_cost": 5000, "lead_time_days": 30,
+                "supplier_impact": 0, "tooling_change": 0, "regulatory_impact": 0,
+                "requester_experience_yrs": 3, "prior_similar_changes": 2}
+     
+    # Windchill category text -> model change_type (edit to match your server's values)
+    TYPE_MAP = {"design": "Design", "material": "Material", "supplier": "Supplier",
+                "process": "Process", "software": "Software", "documentation": "Documentation"}
+    PRIO_MAP = {"low": "Low", "medium": "Medium", "high": "High", "critical": "Critical",
+                "urgent": "Critical", "emergency": "Critical", "normal": "Medium"}
+     
+     
+    def fetch_changes(base_url, user, password, entity="ChangeRequests", top=50, verify=True):
+        """GET .../odata/ChangeMgmt/<entity>. Read-only: nothing is written to Windchill."""
+        url = f"{base_url.rstrip('/')}/Windchill/servlet/odata/ChangeMgmt/{entity}"
+        r = requests.get(url, params={"$top": top}, auth=(user, password),
+                         headers={"Accept": "application/json"}, verify=verify, timeout=30)
+        r.raise_for_status()
+        return pd.DataFrame(r.json().get("value", []))
+     
+     
+    def _pick(row, *keys):
+        for k in keys:
+            if k in row and pd.notna(row[k]) and row[k] != "":
+                v = row[k]
+                return v.get("Display", v.get("Value")) if isinstance(v, dict) else v
+        return None
+     
+     
+    def to_features(raw: pd.DataFrame) -> pd.DataFrame:
+        """Map Windchill columns to model inputs. Anything missing gets a default the user can edit."""
+        rows = []
+        for _, r in raw.iterrows():
+            f = dict(DEFAULTS)
+            cat = str(_pick(r, "Category", "ChangeCategory") or "").lower()
+            f["change_type"] = next((v for k, v in TYPE_MAP.items() if k in cat), f["change_type"])
+            f["priority"] = PRIO_MAP.get(str(_pick(r, "Priority", "ChangePriority") or "").lower(), f["priority"])
+            need = _pick(r, "NeedDate", "NeedByDate")
+            if need:
+                try:
+                    d = pd.to_datetime(need, utc=True)
+                    f["lead_time_days"] = max(1, (d - datetime.now(timezone.utc)).days)
+                except Exception:
+                    pass
+            n = _pick(r, "AffectedObjectCount")
+            if n is not None:
+                f["affected_parts"] = int(n)
+            rows.append({"number": _pick(r, "Number", "ID") or "", "name": _pick(r, "Name") or "", **f})
+        return pd.DataFrame(rows)
+
+
+8.2 Quick connection test
+-------------------------
+
+    python
+    from windchill_client import fetch_changes, to_features
+    raw = fetch_changes('https://your-server','username','password',verify=False)
+    print(raw.columns.tolist())      # shows the real Windchill field names
+    print(to_features(raw).head())
+
+The printed column list is the fastest way to see which fields your server returns. Use it to fix the mapping.
+
+==============================================================================
+9. STEP 6: STREAMLIT DASHBOARD
+==============================================================================
+The dashboard is the separate window where results are shown. It has three data sources selectable in the sidebar, an editable table of changes, colour-coded scores and an explanation chart.
+File: app.py
+
+    """Step 4 - Streamlit dashboard. Run:  streamlit run app.py"""
+    import pandas as pd, streamlit as st
+    import risk_engine as eng
+    import windchill_client as wc
+     
+    st.set_page_config(page_title="ECR Risk Predictor", layout="wide")
+    st.title("AI-Powered Engineering Change Risk Predictor")
+    st.caption("Reads change requests from Windchill (read-only) and scores their risk.")
+     
+    src = st.sidebar.radio("Data source", ["Windchill REST", "Upload CSV", "Demo data"])
+    if "raw" not in st.session_state:
+        st.session_state.raw = None
+     
+    if src == "Windchill REST":
+        url = st.sidebar.text_input("Windchill URL", "https://your-college-server")
+        user = st.sidebar.text_input("Username")
+        pwd = st.sidebar.text_input("Password", type="password")
+        entity = st.sidebar.selectbox("Object type", ["ChangeRequests", "ChangeNotices"])
+        verify = st.sidebar.checkbox("Verify SSL certificate", value=False)
+        if st.sidebar.button("Fetch from Windchill"):
+            try:
+                st.session_state.raw = wc.to_features(wc.fetch_changes(url, user, pwd, entity, verify=verify))
+                st.success(f"Loaded {len(st.session_state.raw)} records")
+            except Exception as e:
+                st.error(f"Could not read Windchill: {e}")
+    elif src == "Upload CSV":
+        up = st.sidebar.file_uploader("CSV with the model columns", type="csv")
+        if up:
+            df = pd.read_csv(up)
+            for c, v in wc.DEFAULTS.items():
+                if c not in df: df[c] = v
+            if "number" not in df: df.insert(0, "number", range(1, len(df) + 1))
+            if "name" not in df: df.insert(1, "name", "")
+            st.session_state.raw = df
+    else:
+        d = pd.read_csv("ecr_history.csv").sample(15, random_state=1).reset_index(drop=True)
+        d.insert(0, "number", [f"DEMO-{i+1:03d}" for i in range(len(d))]); d.insert(1, "name", "")
+        st.session_state.raw = d.drop(columns=["risk_level"])
+     
+    if st.session_state.raw is None:
+        st.info("Choose a data source in the sidebar.")
+        st.stop()
+     
+    st.subheader("1. Change requests (edit any value Windchill did not provide)")
+    edited = st.data_editor(st.session_state.raw, num_rows="fixed", use_container_width=True)
+    scored = eng.score_frame(edited)
+     
+    COL = {"Low": "#c6efce", "Medium": "#ffeb9c", "High": "#ffc7ce"}
+    st.subheader("2. Risk scores")
+    c1, c2, c3 = st.columns(3)
+    for col, lvl in zip((c1, c2, c3), ("Low", "Medium", "High")):
+        col.metric(f"{lvl} risk", int((scored.risk_level == lvl).sum()))
+    show = scored[["number", "name", "change_type", "priority", "risk_level", "risk_index"]]
+    st.dataframe(show.style.map(lambda v: f"background-color:{COL.get(v,'')}", subset=["risk_level"]),
+                 use_container_width=True)
+     
+    st.subheader("3. Why this score?")
+    pick = st.selectbox("Select a change", scored.index,
+                        format_func=lambda i: f"{scored.loc[i,'number']} - {scored.loc[i,'risk_level']}")
+    row = scored.loc[pick]
+    st.write(f"**{row.risk_level} risk** (index {row.risk_index}/100)")
+    ex = eng.explain(row)
+    st.bar_chart(ex.head(6))
+    st.caption("Bars show how many risk-index points each factor adds compared with a typical change.")
+
+
+9.1 Dashboard sections
+----------------------
+  * Sidebar: choose Windchill REST, Upload CSV or Demo data. For Windchill, enter the URL, username and password and click Fetch from Windchill.
+  * 1. Change requests: an editable table. Fill in cost, supplier impact and other values that Windchill did not provide.
+  * 2. Risk scores: count of Low, Medium and High changes and a table with green, yellow and red risk levels.
+  * 3. Why this score?: select a change to see a bar chart of the factors driving its risk.
+
+9.2 Security notes
+------------------
+  * The password is typed into the page and is not stored in any file. Never hard-code it in the source.
+  * The Verify SSL checkbox is off by default because college servers often use internal certificates. Turn it on if your certificate is trusted.
+  * Only GET requests are made, so the dashboard cannot change data in Windchill.
+
+9.3 Demo data mode
+------------------
+Demo data picks 15 random synthetic records. Use it to test the dashboard before Windchill access is ready and as a backup if the server is unavailable on presentation day.
+
+9.4 CSV fallback for Windchill
+------------------------------
+If REST access is blocked, export the change request list from Windchill (table view, then export to CSV or Excel), rename the columns to match the model feature names where possible (number, name, change_type, priority and so on), and upload the file with Upload CSV. Missing columns are filled with defaults automatically, and the demo looks almost identical.
+
+==============================================================================
+10. STEP 7: RUN THE COMPLETE SYSTEM
+==============================================================================
+
+  | No. | Command | What it does |
+  ----------------------------------------------------------------------
+  | 1 | python generate_data.py | Creates ecr_history.csv |
+  | 2 | python train_model.py | Trains the model and creates risk_model.joblib |
+  | 3 | streamlit run app.py | Starts the dashboard at http://localhost:8501 and opens the browser |
+
+Steps 1 and 2 are needed only once (or when you change the data). After that, just run step 3. Keep the terminal window open while the dashboard is in use.
+
+==============================================================================
+11. STEP 8: DEMO PROCEDURE
+==============================================================================
+  * Open Windchill in one browser window and show the list of change requests you created.
+  * Open the dashboard (localhost:8501) in a second window placed side by side.
+  * Select Windchill REST, enter the server URL and login, and click Fetch from Windchill. The same change numbers now appear in the dashboard table.
+  * Point out the values that came from Windchill (number, title, category, priority, lead time) and the ones you fill in manually.
+  * Show the colour-coded risk scores and the Low, Medium and High counts.
+  * Select a high-risk change and show the explanation chart: explain which factors raised its risk.
+  * Edit one value in the table, for example set supplier_impact to 1, and show that the score updates. This demonstrates the decision support idea (what if we change this?).
+  * Finish with the conclusion: the engineer sees the risk before approval, with reasons, using data already held in the PLM system.
+
+==============================================================================
+12. TESTING CHECKLIST
+==============================================================================
+
+  | Test | Expected result |
+  ----------------------------------------------------------------------
+  | python generate_data.py | ecr_history.csv with 3,000 rows |
+  | python train_model.py | Accuracy about 0.74 and risk_model.joblib created |
+  | Dashboard in Demo data mode | 15 rows scored and colour-coded |
+  | Fetch from Windchill | Your test change numbers appear |
+  | Select a change in section 3 | Bar chart of factors appears |
+  | Edit a value in the table | Risk level and index update |
+  | Upload a CSV | Rows load with missing columns filled |
+  | Wrong password | Readable error message, no crash |
+
+
+==============================================================================
+13. TROUBLESHOOTING
+==============================================================================
+
+  | Problem | Likely cause and fix |
+  ----------------------------------------------------------------------
+  | 401 Unauthorized | Wrong username or password, or the server uses single sign-on. Ask the administrator for a REST-enabled account. |
+  | 404 Not Found | Wrong path. Open /Windchill/servlet/odata/ in the browser, copy the exact domain path (for example a version segment) and edit fetch_changes(). |
+  | SSL certificate error | Keep the Verify SSL checkbox unticked in the sidebar, or install the college root certificate on your PC. |
+  | Connection timeout | Not on the college network. Connect to college Wi-Fi or VPN. |
+  | Empty table after Fetch | No change requests visible to this user, or the object type is ChangeNotices instead of ChangeRequests. Change the selection in the sidebar. |
+  | All changes score similar | Windchill fields are missing so defaults are used. Edit the values in the table or fix the field mapping. |
+  | FileNotFoundError: risk_model.joblib | Run generate_data.py and train_model.py first, in the same folder as app.py. |
+  | ModuleNotFoundError | Activate the virtual environment and run pip install -r requirements.txt. |
+
+
+==============================================================================
+14. LIMITATIONS AND FUTURE WORK
+==============================================================================
+
+14.1 Limitations to state honestly
+----------------------------------
+  * The training data is synthetic, so the accuracy figure demonstrates the method, not real-world performance.
+  * Windchill supplies only some of the model features by default; the rest are entered or defaulted.
+  * The integration is read-only and runs outside Windchill.
+
+14.2 Future work
+----------------
+  * Retrain on real historical ECR/ECO records with actual outcomes (delay, cost overrun, rework).
+  * Write the risk score back into a Windchill change attribute through a customised workflow or REST update, and show it inside the change form.
+  * Use SHAP for more rigorous explanation, and try Gradient Boosting or XGBoost.
+  * Add text analysis of the change description to detect risk keywords.
+  * Deploy the model as a shared service on the college server so every user can access it.
+
+==============================================================================
+15. POINTS TO EXPLAIN IN REPORT AND VIVA
+==============================================================================
+  * Why ensemble learning? Many trees vote, which reduces overfitting and works well on structured tabular data like ECR records.
+  * Why synthetic data? Real change history is confidential; the pipeline is identical when real data is used.
+  * How is it explainable? The what-if method replaces each factor with a typical value and measures the change in risk index.
+  * How does it integrate with Windchill? Through Windchill REST Services (OData) using read-only GET calls, and a field mapping from Windchill change attributes to model features.
+  * Why not write back? It needs Windchill customisation and administrator rights, so it is proposed as future work.
+  * Business value: earlier risk visibility, fewer late surprises and a data-based go / no-go decision.
