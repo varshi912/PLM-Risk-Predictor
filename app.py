@@ -13,7 +13,7 @@ if "raw" not in st.session_state:
     st.session_state.raw = None
 
 if src == "Windchill REST":
-    url = st.sidebar.text_input("Windchill URL", "https://your-college-server")
+    url = st.sidebar.text_input("Windchill URL", "http://plm.cit.com")
     user = st.sidebar.text_input("Username")
     pwd = st.sidebar.text_input("Password", type="password")
     entity = st.sidebar.selectbox("Object type", ["ChangeRequests", "ChangeNotices"])

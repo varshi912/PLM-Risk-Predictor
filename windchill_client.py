@@ -37,9 +37,13 @@ PRIO_MAP = {
 }
 
 
+from urllib.parse import urlparse
+
 def fetch_changes(base_url, user, password, entity="ChangeRequests", top=50, verify=True):
     """GET .../odata/ChangeMgmt/<entity>. Read-only: nothing is written to Windchill."""
-    url = f"{base_url.rstrip('/')}/Windchill/servlet/odata/ChangeMgmt/{entity}"
+    p = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    root = f"{p.scheme}://{p.netloc}" if p.netloc else base_url.rstrip('/')
+    url = f"{root}/Windchill/servlet/odata/ChangeMgmt/{entity}"
     r = requests.get(
         url,
         params={"$top": top},
