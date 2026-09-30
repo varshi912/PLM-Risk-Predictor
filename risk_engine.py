@@ -15,8 +15,21 @@ def score_frame(df: pd.DataFrame) -> pd.DataFrame:
     X = df[FEATURES]
     P = MODEL.predict_proba(X)
     out = df.copy()
-    out["risk_level"] = MODEL.predict(X)
-    out["risk_index"] = [round(_index(p), 1) for p in P]
+    raw_preds = MODEL.predict(X)
+    indices = [round(_index(p), 1) for p in P]
+    
+    # Assign consistent risk_level aligned with continuous risk index
+    levels = []
+    for idx, raw_p in zip(indices, raw_preds):
+        if idx >= 65.0:
+            levels.append("High")
+        elif idx >= 30.0:
+            levels.append("Medium")
+        else:
+            levels.append("Low")
+            
+    out["risk_level"] = levels
+    out["risk_index"] = indices
     return out
 
 def explain(row: pd.Series) -> pd.Series:
